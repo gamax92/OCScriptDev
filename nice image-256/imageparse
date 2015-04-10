@@ -1,16 +1,60 @@
 #!/usr/bin/luajit
+local filename
+local dither = true
+local width = 160
+local height = 100
+
 local args = {...}
-if #args ~= 1 then
-	print("Usage: imageparse picture")
+local i = 1
+while i <= #args do
+	local arg = args[i]
+	if arg:sub(1,1) == "-" then
+		if arg == "-w" then
+			i = i + 1 if tonumber(args[i]) == nil then print("Invalid value for '-w'") os.exit(1) end
+			width = tonumber(args[i])
+		elseif arg == "-h" then
+			i = i + 1 if tonumber(args[i]) == nil then print("Invalid value for '-h'") os.exit(1) end
+			height = tonumber(args[i])
+		elseif arg == "-nodither" then
+			dither = false
+		elseif arg == "-dither" then
+			dither = true
+		else
+			print("Invalid argument '" .. arg .. "'")
+			os.exit(1)
+		end
+	elseif filename == nil then
+		filename = arg
+	else
+		print("Extra filename '" .. arg .. "' specified")
+		os.exit(1)
+	end
+	i = i + 1
+end
+if filename == nil then
+	print([[
+Usage: imageparse [options] picture
+
+Options:
+  -w         Set image width
+  -h         Set image height
+  -nodither  Disable dithering
+  -dither    Enable dithering (default)
+]])
 	return
 end
+if height % 2 == 1 then
+	height = height + 1
+	print("Warning: Extending height to " .. height)
+end
+os.execute("mkdir -p tmp")
 -- Generate palette
-os.execute("luajit optipal.lua " .. args[1])
+os.execute("luajit optipal.lua \"" .. filename .. "\"")
 os.execute("convert tmp/blargpal.ppm -colors 16 -unique-colors -depth 8 tmp/optipal.txt")
 os.execute("convert palette685.png -unique-colors -depth 8 tmp/685pal.txt")
 os.execute("convert palette685.png tmp/optipal.txt -append tmp/fullpal.ppm")
 -- Convert image
-os.execute("convert " .. args[1] .. " -resize 160x100! -remap tmp/fullpal.ppm tmp/image.txt")
+os.execute("convert \"" .. filename .. "\" -resize " .. width .. "x" .. height .. "! " .. (dither and "" or "+dither ") .. "-remap tmp/fullpal.ppm tmp/image.txt")
 os.execute("convert tmp/image.txt tmp/image2.png")
 os.execute("convert tmp/image.txt -filter point -resize 640x400! preview-small.png")
 os.execute("convert tmp/image.txt -filter point -resize 960x600! preview-med.png")
@@ -77,7 +121,7 @@ b# -> b(#,true)
 c# -> c(#,true)
 i# -> b(#)
 j# -> c(#)
-f? -> d(1,1,160,50,?)
+f? -> d(1,1,width,height,?)
 h#,#,#,? -> e(#,#,g(?,#))
 v#,#,#,? -> e(#,#,g(?,#),true)
 d#,#,? -> e(#,#,?)
@@ -335,7 +379,7 @@ for i = 1,#stats do
 		end
 	end
 end
-newfile:write([[b0 "):gsub("b(%x-) ",function(a)return"b(0x"..a..",true)"end):gsub("c(%x-) ",function(a)return"c(0x"..a..",true)"end):gsub("i(%x-) ",function(a)return"b(0x"..a..")"end):gsub("j(%x-) ",function(a)return"c(0x"..a..")"end):gsub("f(.) ",function(a)return"d(1,1,160,50,"..a..")"end):gsub("h(%x-),(%x-),(%x-),(.) ",function(a,b,d,c)return"e(0x"..a..",0x"..b..",g("..c..",0x"..d.."))"end):gsub("v(%x-),(%x-),(%x-),(.) ",function(a,b,d,c)return"e(0x"..a..",0x"..b..",g("..c..",0x"..d.."),true)"end):gsub("d(%x-),(%x-),(.) ",function(a,b,c)return"e(0x"..a..",0x"..b..","..c..")"end).."print(u()-z)")()
+newfile:write([[b0 "):gsub("b(%x-) ",function(a)return"b(0x"..a..",true)"end):gsub("c(%x-) ",function(a)return"c(0x"..a..",true)"end):gsub("i(%x-) ",function(a)return"b(0x"..a..")"end):gsub("j(%x-) ",function(a)return"c(0x"..a..")"end):gsub("f(.) ",function(a)return"d(1,1,]] .. width .. [[,]] .. height .. [[,"..a..")"end):gsub("h(%x-),(%x-),(%x-),(.) ",function(a,b,d,c)return"e(0x"..a..",0x"..b..",g("..c..",0x"..d.."))"end):gsub("v(%x-),(%x-),(%x-),(.) ",function(a,b,d,c)return"e(0x"..a..",0x"..b..",g("..c..",0x"..d.."),true)"end):gsub("d(%x-),(%x-),(.) ",function(a,b,c)return"e(0x"..a..",0x"..b..","..c..")"end).."print(u()-z)")()
 ]])
 newfile:close()
 print("Done")
