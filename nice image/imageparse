@@ -49,11 +49,11 @@ if height % 2 == 1 then
 end
 os.execute("mkdir -p tmp")
 -- Convert image
-os.execute("convert \"" .. filename .. "\" -resize " .. width .. "x" .. height .. "! " .. (dither and "" or "+dither ") .. "-colors 16 tmp/image.txt")
+os.execute("convert \"" .. filename .. "\" -resize " .. width .. "x" .. height .. "! -dither " .. (dither and "FloydSteinberg" or "None") .. " -colors 16 tmp/image.txt")
 os.execute("convert tmp/image.txt tmp/image2.png")
-os.execute("convert tmp/image.txt -filter point -resize 640x400! preview-small.png")
-os.execute("convert tmp/image.txt -filter point -resize 960x600! preview-med.png")
-os.execute("convert tmp/image.txt -filter point -resize 1280x800! preview-large.png")
+os.execute("convert tmp/image.txt -filter point -resize " .. width * 4 .. "x" .. height * 4 .. "! preview-small.png")
+os.execute("convert tmp/image.txt -filter point -resize " .. width * 6 .. "x" .. height * 6 .. "! preview-med.png")
+os.execute("convert tmp/image.txt -filter point -resize " .. width * 8 .. "x" .. height * 8 .. "! preview-large.png")
 -- Read image
 palindex = 0
 palette = {}
