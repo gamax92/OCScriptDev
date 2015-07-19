@@ -178,6 +178,17 @@ _wrap = {
 		envs[f] = env
 		return f, err
 	end,
+	inext = function(tbl, key)
+		if type(tbl) ~= "table" then
+			error("bad argument: table expected, got " .. type(tbl),2)
+		elseif type(key) ~= "number" then
+			error("bad argument: int expected, got " .. type(key),2)
+		end
+		key = math.floor(key)+1
+		if key == key and tbl[key] ~= nil then
+			return key, tbl[key]
+		end
+	end,
 	setTextColor = function(color)
 		checkArg(1,color,"number")
 		component.gpu.setForeground(math.floor(math.log(color)/math.log(2)),true)
@@ -274,8 +285,6 @@ _wrap = {
 		end
 		return bp.spaceTotal() - bp.spaceUsed()
 	end,
-	move = function()
-	end,
 	makeDir = function(path)
 		checkArg(1,path,"string")
 		if fs.exists(path) then
@@ -294,13 +303,13 @@ _wrap = {
 
 		local tPath = {}
 		for part in path:gmatch("[^/]+") do
-	   		if part ~= "" and part ~= "." then
-	   			if part == ".." and #tPath > 0 and (dummy or tPath[1] ~= "..") then
-	   				table.remove(tPath)
-	   			else
-	   				table.insert(tPath, part:sub(1,255))
-	   			end
-	   		end
+			if part ~= "" and part ~= "." then
+				if part == ".." and #tPath > 0 and (dummy or tPath[1] ~= "..") then
+					table.remove(tPath)
+				else
+					table.insert(tPath, part:sub(1,255))
+				end
+			end
 		end
 		return table.concat(tPath, "/")
 	end,
@@ -318,7 +327,7 @@ _wrap = {
 	end,
 	queueEvent = function(event, ...)
 		checkArg(1,event,"string")
-		table.insert(comp.eventStack,{event, ...})
+		computer.pushSignal("ccemu:" .. event, ...)
 	end,
 	startTimer = function(timeout)
 		checkArg(1,timeout,"number")
@@ -326,7 +335,7 @@ _wrap = {
 		comp.timerC = comp.timerC + 1
 		local timer = event.timer(timeout, function()
 			comp.timerTrans[timerRet] = nil
-			table.insert(comp.eventStack,{"timer", timerRet})
+			computer.pushSignal("ccemu:timer", timerRet)
 		end)
 		comp.timerTrans[timerRet] = timer
 		return timerRet
@@ -354,6 +363,7 @@ _wrap = {
 
 env = {
 	_VERSION = "Luaj-jse 2.0.3",
+	__inext = _wrap.inext,
 	tostring = tostring,
 	tonumber = tonumber,
 	unpack = table.unpack,
@@ -374,7 +384,6 @@ env = {
 	pcall = pcall,
 	xpcall = xpcall,
 	loadstring = _wrap.loadstring,
-	_realload = load,
 	math = math,
 	string = string,
 	table = table,
@@ -408,7 +417,7 @@ env = {
 		getSize = function(path) if not fs.exists(path) then error("file not found",2) end return fs.size(path) end,
 		getFreeSpace = _wrap.getFreeSpace,
 		makeDir = _wrap.makeDir,
-		move = _wrap.move,
+		move = fs.rename,
 		copy = fs.copy,
 		delete = fs.remove,
 		combine = _wrap.combine,
@@ -569,67 +578,18 @@ env.redstone.setAnalogueOutput = env.redstone.setAnalogOutput
 env.rs = env.redstone
 
 -- Bios entries:
-local eventTrans = {
-	key = "key_down",
-}
-
 function env.os.version()
-    return "CCEmu 1.0"
-end
-local oldinterrupt = event.shouldInterrupt
-local newinterrupt = function() return false end
-event.shouldInterrupt = newinterrupt
-local function getEvent(filter)
-	if #comp.eventStack > 0 then
-		if filter ~= nil then
-			for i = 1,#comp.eventStack do
-				if comp.eventStack[i][1] == filter then
-					local e = comp.eventStack[i]
-					table.remove(comp.eventStack,i)
-					return table.unpack(e)
-				end
-			end
-		else
-			local e = comp.eventStack[1]
-			table.remove(comp.eventStack,1)
-			return table.unpack(e)
-		end
-	end
-	filter = eventTrans[filter] or filter
-	event.shouldInterrupt = oldinterrupt
-	local e = { pcall(event.pull,filter) }
-	event.shouldInterrupt = newinterrupt
-	if e[1] == false and e[2] == "interrupted" then
-	    return "terminate"
-	end
-	table.remove(e,1)
-	if e[1] == "key_down" then
-		if e[3] >= 32 and e[3] <= 126 then
-			table.insert(comp.eventStack,{"char", string.char(e[3])})
-		end
-		return "key", e[4]
-	elseif e[1] == "touch" then
-		return "mouse_click", e[5] + 1, e[3], e[4]
-	elseif e[1] == "drag" then
-		return "mouse_drag", e[5] + 1, e[3], e[4]
-	elseif e[1] == "scroll" then
-		return "mouse_scroll", e[5], e[3], e[4]
-	end
+	return "CCEmu 1.0"
 end
 function env.os.pullEventRaw(filter)
-	while true do
-		local e = { getEvent() }
-		if e[1] ~= nil then return table.unpack(e) end
-	end
+	return coroutine.yield(filter)
 end
 function env.os.pullEvent(filter)
-	while true do
-		local e = { getEvent() }
-		if e[1] == "terminate" then
-		    error("Terminated", 0)
-		end
-		if e[1] ~= nil then return table.unpack(e) end
+	local e = table.pack(env.os.pullEventRaw(filter))
+	if e[1] == "terminate" then
+		error("Terminated", 0)
 	end
+	return table.unpack(e)
 end
 env.sleep = os.sleep
 env.write = function(data)
@@ -646,10 +606,10 @@ env.write = function(data)
 end
 env.print = function(...)
 	local args = {...}
-    for i = 1,#args do
-        args[i] = tostring(args[i])
-    end
-    return env.write(table.concat(args,"\t") .. "\n")
+	for i = 1,#args do
+		args[i] = tostring(args[i])
+	end
+	return env.write(table.concat(args,"\t") .. "\n")
 end
 env.printError = function(...) io.stderr:write(table.concat({...},"\t") .. "\n") end
 env.read = function(pwchar, hist)
@@ -662,61 +622,61 @@ end
 env.loadfile = loadfile
 env.dofile = dofile
 env.os.run = function(newenv, name, ...)
-    local args = {...}
+	local args = {...}
 	setmetatable(newenv, {__index=env})
-    local fn, err = loadfile(name, nil, newenv)
-    if fn then
-        local ok, err = pcall(function() fn(table.unpack(args)) end)
-        if not ok then
-            if err and err ~= "" then
-                env.printError(err)
-            end
-            return false
-        end
-        return true
-    end
-    if err and err ~= "" then
-        env.printError(err)
-    end
-    return false
+	local fn, err = loadfile(name, nil, newenv)
+	if fn then
+		local ok, err = pcall(function() fn(table.unpack(args)) end)
+		if not ok then
+			if err and err ~= "" then
+				env.printError(err)
+			end
+			return false
+		end
+		return true
+	end
+	if err and err ~= "" then
+		env.printError(err)
+	end
+	return false
 end
 
 local tAPIsLoading = {}
 env.os.loadAPI = function(path)
-    local sName = fs.name(path)
-    if tAPIsLoading[sName] == true then
-        env.printError("API " .. sName .. " is already being loaded")
-        return false
-    end
-    tAPIsLoading[sName] = true
+	local sName = fs.name(path)
+	if tAPIsLoading[sName] == true then
+		env.printError("API " .. sName .. " is already being loaded")
+		return false
+	end
+	tAPIsLoading[sName] = true
 
 	local env2
 	env2 = {
 		getfenv = function() return env2 end
 	}
-    setmetatable(env2, {__index = env})
-    local fn, err = loadfile(path, nil, env2)
-    if fn then
-        fn()
-    else
-        env.printError(err)
-        tAPIsLoading[sName] = nil
-        return false
-    end
+	setmetatable(env2, {__index = env})
+	local fn, err = loadfile(path, nil, env2)
+	if fn then
+		fn()
+	else
+		env.printError(err)
+		tAPIsLoading[sName] = nil
+		return false
+	end
 
 	local tmpcopy = {}
-    for k,v in pairs(env2) do
-        tmpcopy[k] =  v
-    end
-    
-    env[sName] = tmpcopy
-    tAPIsLoading[sName] = nil
-    return true
+	for k,v in pairs(env2) do
+		tmpcopy[k] = v
+	end
+	
+	env[sName] = tmpcopy
+	tAPIsLoading[sName] = nil
+	return true
 end
 env.os.unloadAPI = function(name)
-    if _name ~= "_G" and type(env[name]) == "table" then
-        env[name] = nil
-    end
+	if _name ~= "_G" and type(env[name]) == "table" then
+		env[name] = nil
+	end
 end
 env.os.sleep = os.sleep
 if env.http ~= nil then
@@ -803,15 +763,66 @@ if not fn then
 	error("Failed to load: " .. err, 0)
 end
 dPrint("Done")
-local retval = {xpcall(function() return fn(table.unpack(args,2)) end, debug.traceback)}
+
+local oldinterrupt = event.shouldInterrupt
+local newinterrupt = function() return false end
+event.shouldInterrupt = newinterrupt
+local function getEvent()
+	if #comp.eventStack > 0 then
+		local e = comp.eventStack[1]
+		table.remove(comp.eventStack,1)
+		return table.unpack(e)
+	end
+	event.shouldInterrupt = oldinterrupt
+	local e = table.pack(pcall(event.pull))
+	event.shouldInterrupt = newinterrupt
+	table.remove(e,1)
+	if e[1] == "key_down" then
+		if e[3] ~= 0 then
+			table.insert(comp.eventStack,{"char", unicode.char(e[3])})
+		end
+		return "key", e[4]
+	elseif e[1] == "touch" then
+		return "mouse_click", e[5] + 1, e[3], e[4]
+	elseif e[1] == "drag" then
+		return "mouse_drag", e[5] + 1, e[3], e[4]
+	elseif e[1] == "scroll" then
+		return "mouse_scroll", e[5], e[3], e[4]
+	elseif e[1]:sub(1,6) == "ccemu:" then
+		e[1] = e[1]:sub(7)
+		return table.unpack(e)
+	elseif e[1] == "interrupted" then
+		return "terminate"
+	end
+end
+
+local ccproc = coroutine.create(fn)
+local eventFilter
+
+local ok, err = coroutine.resume(ccproc, table.unpack(args,2))
+if not ok then
+	io.stderr:write(err .. "\n")
+end
+if coroutine.status(ccproc) ~= "dead" then
+	eventFilter = err
+	while true do
+		local ccevent = table.pack(getEvent())
+		if ccevent[1] ~= nil and (eventFilter == nil or ccevent[1] == eventFilter) then
+			local ok, err = coroutine.resume(ccproc, table.unpack(ccevent))
+			if not ok then
+				io.stderr:write(err .. "\n")
+			end
+			if coroutine.status(ccproc) == "dead" then
+				break
+			end
+			eventFilter = err
+		end
+	end
+end
+
 event.shouldInterrupt = oldinterrupt
 component.gpu.setBackground(0x000000)
 component.gpu.setForeground(0xFFFFFF)
-if retval[1] == false then
-	io.stderr:write(retval[2] .. "\n")
-else
-	return table.unpack(retval,2)
-end
 if component.gpu.maxDepth() > 1 then
 	dPrint("Restoring palette ...")
 	for i = 1,16 do
