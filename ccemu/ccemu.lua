@@ -14,41 +14,123 @@ local ocpal = {0xFFFFFF,0xFFCC33,0xCC66CC,0x6699FF,0xFFFF33,0x33CC33,0xFF6699,0x
 local oldpal = {}
 
 local args, opt = shell.parse(...)
-local apipath
-local addShell, debugMode = true, false
+local vconfig = {
+	"apipath",
+	"enable-shell",
+	"enable-ccpal",
+	"enable-debug",
+	"enable-native-io",
+	"enable-unicode",
+}
+for i = 1,#vconfig do
+	vconfig[vconfig[i]]=true
+	vconfig[i]=nil
+end
+local config = {
+	apipath = "/rom/apis",
+	["enable-shell"] = true,
+	["enable-ccpal"] = false,
+	["enable-debug"] = false,
+	["enable-native-io"] = true,
+	["enable-unicode"] = false,
+}
+
+if fs.exists("/etc/ccemu.cfg") then
+	local code = "return {"
+	for line in io.lines("/etc/ccemu.cfg") do
+		code = code .. line .. ","
+	end
+	code = code .. "}"
+	local fn, err = load(code, "config", nil, {})
+	if not fn then
+		io.stderr:write("Failed to load config: " .. err .. "\n")
+	else
+		local ok, err = pcall(fn)
+		if not ok then
+			io.stderr:write("Failed to load config: " .. err .. "\n")
+		else
+			for k,v in pairs(err) do
+				if vconfig[k] then
+					config[k] = v
+				else
+					io.stderr:write("Invalid config entry: " .. k .. "\n")
+				end
+			end
+		end
+	end
+else
+	local f, err = io.open("/etc/ccemu.cfg","wb")
+	if not f then
+		io.stderr:write("Failed to write config: " .. err .. "\n")
+	else
+		local keys = {}
+		for k,v in pairs(config) do
+			if type(v) ~= "number" then
+				keys[#keys+1] = k
+			end
+		end
+		table.sort(keys)
+		for i = 1,#keys do
+			local v = config[keys[i]]
+			f:write("[" .. string.format("%q", keys[i]) .. "] = " .. (type(v) == "string" and string.format("%q",v) or tostring(v)) .. "\n")
+		end
+		f:close()
+	end
+end
 
 local usageStr = [[Usage: ccemu (options) (program) (arguments)
  --help          What you see here
  --apipath=path  Load certain apis in folder
  --ccpal         Load CC's palette
+ --native-io     Use OC's io api
  --noshell       Disable built in shell api
  --unicode       Experimentally support unicode
  --debug         Enable debugging]]
 
 for k,v in pairs(opt) do
+	local part = "'" .. string.rep("-", (type(v) == "string" or #k > 1) and 2 or 1) .. k .. "'"
 	if k == "help" then
 		print(usageStr)
 		return
-	elseif k == "apipath" then
-		if type(v) ~= "string" then
-			error("Invalid parameter for " .. k,0)
+	elseif vconfig[k] then
+		if (type(config[k]) == type(v)) or (config[k] > 2 and type(v) == "string") or (config[k] <= 2 and type(v) == "boolean") then
+			config[k] = v
+		elseif type(v) == "boolean" then
+			print("Option: " .. part .. " takes an argument")
+			print(usageStr)
+			return
+		else
+			print("Option: " .. part .. " takes no argument")
+			print(usageStr)
+			return
 		end
-		apipath = shell.resolve(v)
-	elseif k == "noshell" then
-		addShell = false
-	elseif k == "debug" then
-		debugMode = true
-	elseif k == "ccpal" or k == "unicode" then
+	elseif vconfig["enable-" .. k] then
+		config["enable-" .. k] = true
+	elseif k:sub(1,2) == "no" and vconfig["enable-" .. k:sub(3)] then
+		config["enable-" .. k:sub(3)] = false
 	else
-		error("Unknown option " .. k,0)
+		print("Unknown option: " .. part .. "")
+		print(usageStr)
+		return
+	end
+end
+for k,v in pairs(config) do
+	if type(v) == "number" then
+		if v == 1 then
+			config[k] = false
+		elseif v == 2 then
+			config[k] = true
+		else
+			config[k] = nil
+		end
 	end
 end
 
-local dPrint
-if debugMode then
-	dPrint = print
+local dprint
+if config["enable-debug"] then
+	dprint = print
 else
-	dPrint = function() end
+	dprint = function() end
 end
 
 if #args < 1 then
@@ -62,15 +144,15 @@ if args[1] == nil or not fs.exists(args[1]) or fs.isDirectory(args[1]) then
 	error("Invalid program to launch",0)
 end
 
-if apipath ~= nil and not fs.isDirectory(apipath) then
+if config.apipath ~= nil and not fs.isDirectory(config.apipath) then
 	error("Invalid apipath",0)
 end
 
 if component.gpu.maxDepth() > 1 then
-	dPrint("Setting up palette ...")
+	dprint("Setting up palette ...")
 	component.gpu.setBackground(15,true)
 	component.gpu.setForeground(0,true)
-	local pal = opt.ccpal and ccpal or ocpal
+	local pal = config["enable-ccpal"] and ccpal or ocpal
 	for i = 1,16 do
 		oldpal[i] = component.gpu.getPaletteColor(i-1)
 		if oldpal[i] ~= pal[i] then
@@ -82,6 +164,8 @@ end
 local comp = {
 	label = nil,
 	eventStack = {},
+	alarmC = 0,
+	alarmTrans = {},
 	timerC = 0,
 	timerTrans = {},
 }
@@ -122,6 +206,12 @@ local function recurse_spec(results, path, spec)
 				end
 			end
 		end
+	end
+end
+
+function assertArg(n, eval, msg)
+	if not eval then
+		error(string.format("bad argument #%d (%s)", n, msg), 3)
 	end
 end
 
@@ -179,13 +269,13 @@ _wrap = {
 		return f, err
 	end,
 	inext = function(tbl, key)
-		if type(tbl) ~= "table" then
-			error("bad argument: table expected, got " .. type(tbl),2)
-		elseif type(key) ~= "number" then
-			error("bad argument: int expected, got " .. type(key),2)
+		checkArg(1,tbl,"table")
+		checkArg(2,key,"number")
+		if key ~= key then
+			key = 0
 		end
 		key = math.floor(key)+1
-		if key == key and tbl[key] ~= nil then
+		if tbl[key] ~= nil then
 			return key, tbl[key]
 		end
 	end,
@@ -257,7 +347,7 @@ _wrap = {
 			}
 			return file
 		else
-			error("Unsupported mode",2)
+			error("bad argument #2 (invalid mode)",2)
 		end
 	end,
 	list = function(path)
@@ -298,6 +388,35 @@ _wrap = {
 			end
 		end
 	end,
+	move = function(frompath, topath)
+		checkArg(1,frompath,"string")
+		checkArg(2,topath,"string")
+		if not fs.exists(frompath) then
+			error("file not found", 2)
+		elseif fs.exists(topath) then
+			error("file exists", 2)
+		else
+			local ok, err = fs.rename(frompath, topath)
+			if not ok then
+				err = err or "unknown error"
+				error(err, 2)
+			end
+		end
+	end,
+	copy = function(frompath, topath)
+		checkArg(1,frompath,"string")
+		checkArg(2,topath,"string")
+		if not fs.exists(frompath) then
+			error("file not found", 2)
+		elseif fs.exists(topath) then
+			error("file exists", 2)
+		else
+			local ok, err = fs.copy(frompath, topath)
+			if not ok then
+				error(err, 2)
+			end
+		end
+	end,
 	_combine = function(basePath, localPath, dummy)
 		local path = ("/" .. basePath .. "/" .. localPath):gsub("\\", "/")
 
@@ -322,7 +441,7 @@ _wrap = {
 		return tonumber(computer.address():sub(1,4),16)
 	end,
 	setComputerLabel = function(label)
-		checkArg(1,label,"string")
+		checkArg(1,label,"string","nil")
 		comp.label = label
 	end,
 	queueEvent = function(event, ...)
@@ -345,19 +464,23 @@ _wrap = {
 	end,
 	cancelTimer = function(id)
 		checkArg(1,id,"number")
-		event.cancel(comp.timerTrans[id])
-		comp.timerTrans[id] = nil
+		if id == id and comp.timerTrans[id] ~= nil then
+			event.cancel(comp.timerTrans[id])
+			comp.timerTrans[id] = nil
+		end
 	end,
 	cancelAlarm = function()
-		-- TODO: Alarm
+		checkArg(1,id,"number")
+		if id == id and comp.alarmTrans[id] ~= nil then
+			event.cancel(comp.alarmTrans[id])
+			comp.alarmTrans[id] = nil
+		end
 	end,
 	time = function()
-		local ost = os.date()
-		return ost.hour + ((ost.min * 60 + ost.sec)/3600)
+		return math.floor((os.time()%86400)/3.600)/1000
 	end,
 	day = function()
-		local ost = os.date()
-		return ((ost.year - 1970) * 365) + (ost.month * 30) + ost.day
+		return math.floor(os.time()/86400) + 1
 	end
 }
 
@@ -400,7 +523,7 @@ env = {
 		setBackgroundColour = _wrap.setBackgroundColor,
 		setCursorBlink = term.setCursorBlink,
 		scroll = _wrap.scroll,
-		write = term.write,
+		write = function(text) checkArg(1,text,"string") term.write(text) end,
 		isColor = function() return component.gpu.maxDepth() > 1 end,
 		isColour = function() return component.gpu.maxDepth() > 1 end,
 	},
@@ -414,12 +537,12 @@ env = {
 		isReadOnly = function() return false end,
 		getName = function(path) local name = fs.name(path) return name == "" and "root" or name end,
 		getDrive = _wrap.getDrive,
-		getSize = function(path) if not fs.exists(path) then error("file not found",2) end return fs.size(path) end,
+		getSize = function(path) checkArg(1,path,"string") if not fs.exists(path) then error("file not found",2) end return fs.size(path) end,
 		getFreeSpace = _wrap.getFreeSpace,
 		makeDir = _wrap.makeDir,
-		move = fs.rename,
-		copy = fs.copy,
-		delete = fs.remove,
+		move = _wrap.move,
+		copy = _wrap.copy,
+		delete = function(path) checkArg(1,path,"string") fs.remove(path) end,
 		combine = _wrap.combine,
 	},
 	os = {
@@ -441,10 +564,10 @@ env = {
 	},
 	-- TODO: Peripherals
 	peripheral = {
-		isPresent = function() end,
-		getType = function() end,
-		getMethods = function() end,
-		call = function() end,
+		isPresent = function(side) checkArg(1,side,"string") return false end,
+		getType = function(side) checkArg(1,side,"string") end,
+		getMethods = function(side) checkArg(1,side,"string") end,
+		call = function(side, method) checkArg(1,side,"string") checkArg(2,method,"string") error("no peripheral attached",2) end,
 	},
 	bit = {
 		blshift = bit32.lshift,
@@ -458,7 +581,7 @@ env = {
 }
 
 env._G = env
-if opt.unicode then
+if config["enable-unicode"] then
 	env.string = tablecopy(string)
 	env.string.reverse = unicode.reverse
 	env.string.char = unicode.char
@@ -473,105 +596,111 @@ if component.isAvailable("internet") and component.internet.isHttpEnabled() then
 	--env.http = {
 	--}
 end
+
+local redstone
 if component.isAvailable("redstone") then
-	env.redstone = {
-		getSides = function() return {"top","bottom","left","right","front","back"} end,
-		getInput = function(side) return component.redstone.getInput(sides[side]) ~= 0 end,
-		getOutput = function(side) return component.redstone.getOutput(sides[side]) ~= 0 end,
-		setOutput = function(side, val) return component.redstone.setOutput(sides[side],val and 15 or 0) end,
-		getAnalogInput = function(side) return component.redstone.getInput(sides[side]) end,
-		getAnalogOutput = function(side) return component.redstone.getOutput(sides[side]) end,
-		setAnalogOutput = function(side, val) return component.redstone.setOutput(sides[side],val) end,
-		getBundledInput = function(side)
-			side = sides[side]
-			local val
-			for i = 0,15 do
-				if component.redstone.getBundledInput(side,i) > 0 then
-					val = val + (2^i)
-				end
-			end
-			return val
-		end,
-		getBundledOutput = function(side)
-			side = sides[side]
-			local val
-			for i = 0,15 do
-				if component.redstone.getBundledOutput(side,i) > 0 then
-					val = val + (2^i)
-				end
-			end
-			return val
-		end,
-		setBundledOutput = function(side, val) end,
-		testBundledInput = function() end,
-	}
-	env.redstone.getAnalogueInput = env.redstone.getAnalogInput
-	env.redstone.getAnalogueOutput = env.redstone.getAnalogOutput
-	env.redstone.setAnalogueOutput = env.redstone.setAnalogOutput
-	env.rs = env.redstone
+	redstone = component.redstone
 else
-	dPrint("Using fake redstone api")
-	local outputs = {top=0, bottom=0, left=0, right=0, front=0, back=0}
-	local bundled = {top=0, bottom=0, left=0, right=0, front=0, back=0}
-	env.redstone = {
-		getSides = function() return {"top","bottom","left","right","front","back"} end,
-		getInput = function(side)
-			checkArg(1,side,"string")
-			if outputs[side] == nil then error("bad argument #1 (invalid side)",2) end
-			return false
+	dprint("Using fake redstone api")
+	local outputs = {[0]=0, 0, 0, 0, 0, 0}
+	local bundled = {[0]=0, 0, 0, 0, 0, 0}
+	redstone = {
+		getInput = function()
+			return 0
 		end,
 		getOutput = function(side)
-			checkArg(1,side,"string")
-			if outputs[side] == nil then error("bad argument #1 (invalid side)",2) end
-			return outputs[side] > 0
-		end,
-		setOutput = function(side,val)
-			checkArg(1,side,"string")
-			checkArg(2,val,"boolean")
-			if outputs[side] == nil then error("bad argument #1 (invalid side)",2) end
-			outputs[side] = val and 15 or 0
-		end,
-		getAnalogInput = function(side)
-			checkArg(1,side,"string")
-			if outputs[side] == nil then error("bad argument #1 (invalid side)",2) end
-			return 0
-		end,
-		getAnalogOutput = function(side)
-			checkArg(1,side,"string")
-			if outputs[side] == nil then error("bad argument #1 (invalid side)",2) end
 			return outputs[side]
 		end,
-		setAnalogOutput = function(side,val)
-			checkArg(1,side,"string")
-			checkArg(2,val,"number")
-			if outputs[side] == nil then error("bad argument #1 (invalid side)",2) end
-			if val < 0 or val >= 16 then error("bad argument #2 (number out of range)",2) end
-			outputs[side] = math.floor(val)
+		setOutput = function(side, val)
+			outputs[side] = val
 		end,
-		getBundledInput = function(side)
-			checkArg(1,side,"string")
-			if bundled[side] == nil then error("bad argument #1 (invalid side)",2) end
+		getBundledInput = function()
 			return 0
 		end,
-		getBundledOutput = function(side)
-			checkArg(1,side,"string")
-			if bundled[side] == nil then error("bad argument #1 (invalid side)",2) end
-			return bundled[side]
+		getBundledOutput = function(side, color)
+			return bit32.band(bundled[side],2^color) > 0 and math.huge or 0
 		end,
-		setBundledOutput = function(side,val)
-			checkArg(1,side,"string")
-			checkArg(2,val,"number")
-			if bundled[side] == nil then error("bad argument #1 (invalid side)",2) end
-			bundled[side] = math.max(math.min(math.floor(val),2^31),0)
-		end,
-		testBundledInput = function(side,val)
-			checkArg(1,side,"string")
-			checkArg(2,val,"number")
-			if bundled[side] == nil then error("bad argument #1 (invalid side)",2) end
-			return val == 0
+		setBundledOutput = function (side, color, value)
+			bundled[side] = bit32.band(bundled[side],bit32.bnot(2^color)) + (value > 0 and 2^color or 0)
 		end,
 	}
 end
+local validSides = {top=true,bottom=true,left=true,right=true,front=true,back=true}
+env.redstone = {
+	getSides = function() return {"top","bottom","left","right","front","back"} end,
+	getInput = function(side)
+		checkArg(1,side,"string")
+		assertArg(1, validSides[side], "invalid side")
+		return redstone.getInput(sides[side]) ~= 0
+	end,
+	getOutput = function(side)
+		checkArg(1,side,"string")
+		assertArg(1, validSides[side], "invalid side")
+		return redstone.getOutput(sides[side]) ~= 0
+	end,
+	setOutput = function(side, val)
+		checkArg(1,side,"string")
+		checkArg(2,val,"boolean")
+		assertArg(1, validSides[side], "invalid side")
+		return redstone.setOutput(sides[side],val and 15 or 0)
+	end,
+	getAnalogInput = function(side)
+		checkArg(1,side,"string")
+		assertArg(1, validSides[side], "invalid side")
+		return redstone.getInput(sides[side])
+	end,
+	getAnalogOutput = function(side)
+		checkArg(1,side,"string")
+		assertArg(1, validSides[side], "invalid side")
+		return redstone.getOutput(sides[side])
+	end,
+	setAnalogOutput = function(side, val)
+		checkArg(1,side,"string")
+		checkArg(2,val,"number")
+		assertArg(1, validSides[side], "invalid side")
+		return redstone.setOutput(sides[side],val)
+	end,
+	getBundledInput = function(side)
+		checkArg(1,side,"string")
+		assertArg(1, validSides[side], "invalid side")
+		side = sides[side]
+		local val
+		for i = 0,15 do
+			if redstone.getBundledInput(side,i) > 0 then
+				val = val + (2^i)
+			end
+		end
+		return val
+	end,
+	getBundledOutput = function(side)
+		checkArg(1,side,"string")
+		assertArg(1, validSides[side], "invalid side")
+		side = sides[side]
+		local val
+		for i = 0,15 do
+			if redstone.getBundledOutput(side,i) > 0 then
+				val = val + (2^i)
+			end
+		end
+		return val
+	end,
+	setBundledOutput = function(side, val)
+		checkArg(1,side,"string")
+		checkArg(2,val,"number")
+		assertArg(1, validSides[side], "invalid side")
+		side = sides[side]
+		for i = 0,15 do
+			redstone.setBundledOutput(side,i,bit32.band(val,2^color) > 0 and math.huge or 0)
+		end
+	end,
+	testBundledInput = function(side, val)
+		checkArg(1,side,"string")
+		checkArg(2,val,"number")
+		assertArg(1, validSides[side], "invalid side")
+		-- TODO: Implement this
+		return false
+	end,
+}
 env.redstone.getAnalogueInput = env.redstone.getAnalogInput
 env.redstone.getAnalogueOutput = env.redstone.getAnalogOutput
 env.redstone.setAnalogueOutput = env.redstone.setAnalogOutput
@@ -600,7 +729,9 @@ env.write = function(data)
 		if c then count = count + 1 end
 		return a,b,c
 	end
-	term.write(data,true)
+	local x = term.getCursor()
+	local w = component.gpu.getResolution()
+	term.write(data,unicode.len(data) + x - 1 > w)
 	text.wrap = otw
 	return count
 end
@@ -684,23 +815,31 @@ if env.http ~= nil then
 	-- TODO: http.post
 end
 
-if apipath ~= nil then
-	for file in fs.list(apipath) do
-		local path = apipath .. "/" .. file
-		if not fs.isDirectory(path) and file ~= "colours" then
-			dPrint("Loading " .. file)
+local apiblacklist = {
+	colours = true,
+}
+if config["enable-native-io"] then
+	dprint("Using OC io")
+	apiblacklist.io = true
+	env.io = io
+end
+if config.apipath ~= nil then
+	for file in fs.list(config.apipath) do
+		local path = config.apipath .. "/" .. file
+		if not fs.isDirectory(path) and not apiblacklist[file] then
+			dprint("Loading " .. file)
 			local stat,err = pcall(env.os.loadAPI,path)
 			if stat == false then
 				env.printError(err)
 			end
 		else
-			dPrint("Ignoring " .. file)
+			dprint("Ignoring " .. file)
 		end
 	end
 end
 
 if env.colors ~= nil then
-	dPrint("Adding colours from colors")
+	dprint("Adding colours from colors")
 	env.colours = {}
 	for k,v in pairs(env.colors) do
 		if k == "gray" then k = "grey" end
@@ -710,23 +849,35 @@ if env.colors ~= nil then
 end
 
 -- Shell api
-if addShell then
+local oldpath
+if config["enable-shell"] then
+	dprint("Using fake shell api")
+	oldpath = shell.getPath()
+
+	local ccPath = {".","/rom/programs"}
+	if env.term.isColor() then table.insert(ccPath,"/rom/programs/advanced") end
+	if env.turtle then
+		table.insert(ccPath,"/rom/programs/turtle")
+	else
+		table.insert(ccPath,"/rom/programs/rednet")
+		table.insert(ccPath,"/rom/programs/fun")
+		if env.term.isColor() then table.insert(ccPath,"/rom/programs/fun/advanced") end
+	end
+	if env.pocket then table.insert(ccPath,"/rom/programs/pocket") end
+	if env.commands then table.insert(ccPath,"/rom/programs/command") end
+	if env.http then table.insert(ccPath,"/rom/programs/http") end
+	shell.setPath(table.concat(ccPath,":"))
+
 	env.shell = {
 		dir = shell.getWorkingDirectory,
 		setDir = shell.setWorkingDirectory,
 		path = shell.getPath,
 		setPath = shell.setPath,
-		resolve = shell.resolve,
-		resolveProgram = function(path) return shell.resolve(path,"lua") end,
-		aliases = function()
-			local toret = {}
-			for k,v in shell.aliases() do
-				toret[k] = v
-			end
-			return toret
-		end,
-		setAlias = shell.setAlias,
-		clearAlias = function(alias) shell.setAlias(alias,nil) end,
+		resolve = function(path) checkArg(1,path,"string") return shell.resolve(path) end,
+		resolveProgram = function(path) checkArg(1,path,"string") return shell.resolve(path,"lua") end,
+		aliases = function() return select(2,shell.aliases()) end,
+		setAlias = function(alias, value) checkArg(1,alias,"string") checkArg(2,value,"string") shell.setAlias(alias,value) end,
+		clearAlias = function(alias) checkArg(1,alias,"string") shell.setAlias(alias,nil) end,
 		programs = function(hidden)
 			local firstlist = {}
 			for part in string.gmatch(shell.getPath(), "[^:]+") do
@@ -746,23 +897,23 @@ if addShell then
 			table.sort(list)
 			return list
 		end,
-		getRunningProgram = function() return process.running():sub(2) end,
+		getRunningProgram = function() return args[1] end,
 		run = function(command, ...) return shell.execute(command, nil, ...) end,
 		openTab = function() end,
 		switchTab = function() end,
 	}
 end
 
-if debugMode then
+if config["enable-debug"] then
 	io.stdout:write("Loading program ... ")
 end
 
 local fn,err = loadfile(args[1], nil, env)
 if not fn then
-	dPrint("Fail")
+	dprint("Fail")
 	error("Failed to load: " .. err, 0)
 end
-dPrint("Done")
+dprint("Done")
 
 local oldinterrupt = event.shouldInterrupt
 local newinterrupt = function() return false end
@@ -777,8 +928,9 @@ local function getEvent()
 	local e = table.pack(pcall(event.pull))
 	event.shouldInterrupt = newinterrupt
 	table.remove(e,1)
-	if e[1] == "key_down" then
-		if e[3] ~= 0 then
+	if e[1] == nil then
+	elseif e[1] == "key_down" then
+		if e[3] >= 32 and e[3] ~= 127 then
 			table.insert(comp.eventStack,{"char", unicode.char(e[3])})
 		end
 		return "key", e[4]
@@ -821,10 +973,13 @@ if coroutine.status(ccproc) ~= "dead" then
 end
 
 event.shouldInterrupt = oldinterrupt
+if config["enable-shell"] then
+	shell.setPath(oldpath)
+end
 component.gpu.setBackground(0x000000)
 component.gpu.setForeground(0xFFFFFF)
 if component.gpu.maxDepth() > 1 then
-	dPrint("Restoring palette ...")
+	dprint("Restoring palette ...")
 	for i = 1,16 do
 		component.gpu.setPaletteColor(i-1, oldpal[i])
 	end
