@@ -268,17 +268,6 @@ _wrap = {
 		envs[f] = env
 		return f, err
 	end,
-	inext = function(tbl, key)
-		checkArg(1, tbl, "table")
-		checkArg(2, key, "number")
-		if key ~= key then
-			key = 0
-		end
-		key = math.floor(key)+1
-		if tbl[key] ~= nil then
-			return key, tbl[key]
-		end
-	end,
 	setTextColor = function(color)
 		checkArg(1, color, "number")
 		component.gpu.setForeground(math.floor(math.log(color)/math.log(2)), true)
@@ -459,8 +448,16 @@ _wrap = {
 		comp.timerTrans[timerRet] = timer
 		return timerRet
 	end,
-	setAlarm = function()
-		-- TODO: Alarm
+	setAlarm = function(time)
+		checkArg(1, time, "number")
+		assertArg(1, time >= 0 and time < 24, "number out of range")
+		local curtime = os.time()
+		local alarmRet = comp.alarmC
+		comp.alarmC = comp.alarmC + 1
+		local timeout = (time*3600) - (curtime%86400)
+		if timeout < 0 then timeout = timeout + 86400 end
+		comp.alarmTrans[alarmRet] = curtime + timeout
+		return alarmRet
 	end,
 	cancelTimer = function(id)
 		checkArg(1, id, "number")
@@ -471,8 +468,7 @@ _wrap = {
 	end,
 	cancelAlarm = function()
 		checkArg(1, id, "number")
-		if id == id and comp.alarmTrans[id] ~= nil then
-			event.cancel(comp.alarmTrans[id])
+		if id == id then
 			comp.alarmTrans[id] = nil
 		end
 	end,
@@ -486,7 +482,7 @@ _wrap = {
 
 env = {
 	_VERSION = "Luaj-jse 2.0.3",
-	__inext = _wrap.inext,
+	__inext = ipairs({}),
 	tostring = tostring,
 	tonumber = tonumber,
 	unpack = table.unpack,
@@ -523,7 +519,7 @@ env = {
 		setBackgroundColour = _wrap.setBackgroundColor,
 		setCursorBlink = term.setCursorBlink,
 		scroll = _wrap.scroll,
-		write = function(text) checkArg(1, text, "string") term.write(text) end,
+		write = function(text) term.write(tostring(text)) end, -- TODO: Dummy serializer?
 		isColor = function() return component.gpu.maxDepth() > 1 end,
 		isColour = function() return component.gpu.maxDepth() > 1 end,
 	},
@@ -716,7 +712,7 @@ end
 function env.os.pullEvent(filter)
 	local e = table.pack(env.os.pullEventRaw(filter))
 	if e[1] == "terminate" then
-		error("Terminated", 0)
+		error("interrupted", 0)
 	end
 	return table.unpack(e)
 end
@@ -848,25 +844,87 @@ if env.colors ~= nil then
 	end
 end
 
+local function getEvent()
+	if #comp.eventStack > 0 then
+		local e = comp.eventStack[1]
+		table.remove(comp.eventStack, 1)
+		return table.unpack(e)
+	end
+	local e = table.pack(pcall(event.pull, 1))
+	table.remove(e, 1)
+	if e[1] == nil then
+	elseif e[1] == "key_down" then
+		if e[3] >= 32 and e[3] ~= 127 then
+			table.insert(comp.eventStack, {"char", unicode.char(e[3])})
+		end
+		return "key", e[4]
+	elseif e[1] == "touch" then
+		return "mouse_click", e[5] + 1, e[3], e[4]
+	elseif e[1] == "drag" then
+		return "mouse_drag", e[5] + 1, e[3], e[4]
+	elseif e[1] == "scroll" then
+		return "mouse_scroll", e[5], e[3], e[4]
+	elseif e[1]:sub(1, 6) == "ccemu:" then
+		e[1] = e[1]:sub(7)
+		return table.unpack(e)
+	elseif e[1] == "interrupted" then
+		return "terminate"
+	end
+end
+
+local function startProgram(filename)
+	if config["enable-debug"] then
+		io.stdout:write("Loading '" .. filename .. "' ... ")
+	end
+
+	local fn, err = loadfile(filename, nil, env)
+	if not fn then
+		dprint("Fail")
+		error("Failed to load: " .. err, 0)
+	end
+	dprint("Done")
+
+	local ccproc = coroutine.create(fn)
+	local eventFilter
+
+	local ok, err = coroutine.resume(ccproc, table.unpack(args, 2))
+	if not ok then
+		io.stderr:write(err .. "\n")
+	end
+	if coroutine.status(ccproc) ~= "dead" then
+		eventFilter = err
+		while true do
+			for k,v in pairs(comp.alarmTrans) do
+				if os.time() >= v then
+					comp.alarmTrans[k] = nil
+					computer.pushSignal("ccemu:alarm", k)
+				end
+			end
+			local ccevent = table.pack(getEvent())
+			if ccevent[1] ~= nil and (eventFilter == nil or ccevent[1] == eventFilter) then
+				local ok, err = coroutine.resume(ccproc, table.unpack(ccevent))
+				if not ok then
+					io.stderr:write(err .. "\n")
+				end
+				if coroutine.status(ccproc) == "dead" then
+					break
+				end
+				eventFilter = err
+			end
+		end
+	end
+end
+
 -- Shell api
 local oldpath
+local oldalias
 if config["enable-shell"] then
 	dprint("Using fake shell api")
 	oldpath = shell.getPath()
-
-	local ccPath = {".", "/rom/programs"}
-	if env.term.isColor() then table.insert(ccPath, "/rom/programs/advanced") end
-	if env.turtle then
-		table.insert(ccPath, "/rom/programs/turtle")
-	else
-		table.insert(ccPath, "/rom/programs/rednet")
-		table.insert(ccPath, "/rom/programs/fun")
-		if env.term.isColor() then table.insert(ccPath, "/rom/programs/fun/advanced") end
+	oldalias = tablecopy(select(2, shell.aliases()))
+	for alias in pairs(oldalias) do
+		shell.setAlias(alias, nil)
 	end
-	if env.pocket then table.insert(ccPath, "/rom/programs/pocket") end
-	if env.commands then table.insert(ccPath, "/rom/programs/command") end
-	if env.http then table.insert(ccPath, "/rom/programs/http") end
-	shell.setPath(table.concat(ccPath, ":"))
 
 	env.shell = {
 		dir = shell.getWorkingDirectory,
@@ -875,7 +933,7 @@ if config["enable-shell"] then
 		setPath = shell.setPath,
 		resolve = function(path) checkArg(1, path, "string") return shell.resolve(path) end,
 		resolveProgram = function(path) checkArg(1, path, "string") return shell.resolve(path, "lua") end,
-		aliases = function() return select(2, shell.aliases()) end,
+		aliases = function() return tablecopy(select(2, shell.aliases())) end,
 		setAlias = function(alias, value) checkArg(1, alias, "string") checkArg(2, value, "string") shell.setAlias(alias, value) end,
 		clearAlias = function(alias) checkArg(1, alias, "string") shell.setAlias(alias, nil) end,
 		programs = function(hidden)
@@ -902,79 +960,23 @@ if config["enable-shell"] then
 		openTab = function() end,
 		switchTab = function() end,
 	}
-end
-
-if config["enable-debug"] then
-	io.stdout:write("Loading program ... ")
-end
-
-local fn, err = loadfile(args[1], nil, env)
-if not fn then
-	dprint("Fail")
-	error("Failed to load: " .. err, 0)
-end
-dprint("Done")
-
-local oldinterrupt = event.shouldInterrupt
-local newinterrupt = function() return false end
-event.shouldInterrupt = newinterrupt
-local function getEvent()
-	if #comp.eventStack > 0 then
-		local e = comp.eventStack[1]
-		table.remove(comp.eventStack, 1)
-		return table.unpack(e)
-	end
-	event.shouldInterrupt = oldinterrupt
-	local e = table.pack(pcall(event.pull))
-	event.shouldInterrupt = newinterrupt
-	table.remove(e, 1)
-	if e[1] == nil then
-	elseif e[1] == "key_down" then
-		if e[3] >= 32 and e[3] ~= 127 then
-			table.insert(comp.eventStack, {"char", unicode.char(e[3])})
-		end
-		return "key", e[4]
-	elseif e[1] == "touch" then
-		return "mouse_click", e[5] + 1, e[3], e[4]
-	elseif e[1] == "drag" then
-		return "mouse_drag", e[5] + 1, e[3], e[4]
-	elseif e[1] == "scroll" then
-		return "mouse_scroll", e[5], e[3], e[4]
-	elseif e[1]:sub(1, 6) == "ccemu:" then
-		e[1] = e[1]:sub(7)
-		return table.unpack(e)
-	elseif e[1] == "interrupted" then
-		return "terminate"
+	
+	if fs.exists("/rom/startup") then
+		startProgram("/rom/startup")
 	end
 end
 
-local ccproc = coroutine.create(fn)
-local eventFilter
+startProgram(args[1])
 
-local ok, err = coroutine.resume(ccproc, table.unpack(args, 2))
-if not ok then
-	io.stderr:write(err .. "\n")
-end
-if coroutine.status(ccproc) ~= "dead" then
-	eventFilter = err
-	while true do
-		local ccevent = table.pack(getEvent())
-		if ccevent[1] ~= nil and (eventFilter == nil or ccevent[1] == eventFilter) then
-			local ok, err = coroutine.resume(ccproc, table.unpack(ccevent))
-			if not ok then
-				io.stderr:write(err .. "\n")
-			end
-			if coroutine.status(ccproc) == "dead" then
-				break
-			end
-			eventFilter = err
-		end
-	end
-end
-
-event.shouldInterrupt = oldinterrupt
 if config["enable-shell"] then
 	shell.setPath(oldpath)
+	local badalias = tablecopy(select(2, shell.aliases()))
+	for alias in pairs(badalias) do
+		shell.setAlias(alias, nil)
+	end
+	for alias, value in pairs(oldalias) do
+		shell.setAlias(alias, value)
+	end
 end
 component.gpu.setBackground(0x000000)
 component.gpu.setForeground(0xFFFFFF)
