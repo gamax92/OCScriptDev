@@ -219,24 +219,25 @@ local envs = {}
 _wrap = {
 	-- TODO: Can getfenv and setfenv be recreated?
 	getfenv = function(level)
-		level = level or 1
-		if type(level) ~= "function" and type(level) ~= "number" then
-			error("bad argument (number expected, got " .. type(level) .. ")", 2)
-		end
-		if type(level) == "number" and level < 0 then
-			error("bad argument #1 (level must be non-negative)", 2)
-		end
+		if level == nil then level = 1 end
 		if type(level) == "function" then
 			return envs[level] or env
+		else
+			checkArg(1, level, "number")
+			assertArg(1, level > -1, "level must be non-negative")
+			local info = debug.getinfo(math.max(level, 0) + 1)
+			assertArg(1, info, "invalid level")
 		end
 		return env
 	end,
 	setfenv = function(level, tbl)
-		level = level or 1
+		if level == nil then level = 1 end
 		checkArg(2, tbl, "table")
 		checkArg(1, level, "number", "function")
-		if type(level) == "number" and level < 0 then
-			error("bad argument #1 (level must be non-negative)", 2)
+		if type(level) == "number" then
+			assertArg(1, level > -1, "level must be non-negative")
+			local info = debug.getinfo(math.max(level, 0) + 1)
+			assertArg(1, info, "invalid level")
 		end
 		if type(level) == "function" and envs[level] ~= nil then
 			envs[level] = tbl
